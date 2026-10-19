@@ -2,6 +2,48 @@
 
 #include <esp_log.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+// ---- ZCODE PATCH: codec I2C 容错 ----
+// 该板 ESP32-S3 在 Wi-Fi/PSRAM 高负载下偶发单次 I2C 事务失败，原代码用
+// ESP_ERROR_CHECK 包住，一次失败即 abort() 重启。改为重试 + 只告警。
+#define ESP_ERROR_CHECK_SOFT(x)                                     \
+    do {                                                            \
+        esp_err_t _e = (x);                                         \
+        if (_e != ESP_OK) {                                         \
+            ESP_LOGE(TAG, #x " failed: %d (continuing)", (int)_e);  \
+        }                                                           \
+    } while (0)
+
+static esp_err_t RetryCodecOpen(esp_codec_dev_handle_t dev,
+                                esp_codec_dev_sample_info_t *fs,
+                                const char *what) {
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 6; ++i) {
+        err = esp_codec_dev_open(dev, fs);
+        if (err == ESP_OK) {
+            if (i > 0) ESP_LOGW(TAG, "%s open ok after %d retries", what, i);
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "%s open failed: %d, retry %d/6", what, (int)err, i + 1);
+        vTaskDelay(pdMS_TO_TICKS(8));
+    }
+    return err;
+}
+
+static void DumpEs8388Registers(const audio_codec_ctrl_if_t *ctrl) {
+    for (int reg = 0x00; reg <= 0x16; ++reg) {
+        uint8_t v = 0;
+        if (ctrl->read_reg(ctrl, reg, 1, &v, 1) == 0) {
+            ESP_LOGI(TAG, "ES8388 reg 0x%02x = 0x%02x", reg, v);
+        } else {
+            ESP_LOGW(TAG, "ES8388 reg 0x%02x read failed", reg);
+        }
+    }
+}
+// ---- end ZCODE PATCH ----
+
 #define TAG "Es8388AudioCodec"
 
 Es8388AudioCodec::Es8388AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sample_rate, int output_sample_rate,
@@ -47,7 +89,13 @@ Es8388AudioCodec::Es8388AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     es8388_cfg.pa_reverted = false;
     es8388_cfg.hw_gain.pa_voltage = 5.0;
     es8388_cfg.hw_gain.codec_dac_voltage = 3.3;
-    codec_if_ = es8388_codec_new(&es8388_cfg);
+    for (int attempt = 0; attempt < 6 && codec_if_ == nullptr; ++attempt) {
+        codec_if_ = es8388_codec_new(&es8388_cfg);
+        if (codec_if_ == nullptr) {
+            ESP_LOGW(TAG, "es8388_codec_new failed, retry %d/6", attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(8));
+        }
+    }
     assert(codec_if_ != NULL);
 
     esp_codec_dev_cfg_t outdev_cfg = {
@@ -67,13 +115,13 @@ Es8388AudioCodec::Es8388AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     assert(input_dev_ != NULL);
     esp_codec_set_disable_when_closed(output_dev_, false);
     esp_codec_set_disable_when_closed(input_dev_, false);
-    ESP_LOGI(TAG, "Es8388AudioCodec initialized");
+    ESP_LOGI(TAG, "Es8388AudioCodec initialized [ZCODE-PATCH-v1]");
 }
 
 Es8388AudioCodec::~Es8388AudioCodec() {
-    ESP_ERROR_CHECK(esp_codec_dev_close(output_dev_));
+    ESP_ERROR_CHECK_SOFT(esp_codec_dev_close(output_dev_));
     esp_codec_dev_delete(output_dev_);
-    ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
+    ESP_ERROR_CHECK_SOFT(esp_codec_dev_close(input_dev_));
     esp_codec_dev_delete(input_dev_);
 
     audio_codec_delete_codec_if(codec_if_);
@@ -137,7 +185,7 @@ void Es8388AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
 }
 
 void Es8388AudioCodec::SetOutputVolume(int volume) {
-    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
+    ESP_ERROR_CHECK_SOFT(esp_codec_dev_set_out_vol(output_dev_, volume));
     AudioCodec::SetOutputVolume(volume);
 }
 
@@ -157,15 +205,23 @@ void Es8388AudioCodec::EnableInput(bool enable) {
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
-        ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
+        ESP_ERROR_CHECK_SOFT(RetryCodecOpen(input_dev_, &fs, "input"));
         if (input_reference_) {
             uint8_t gain = (11 << 4) + 0;
             ctrl_if_->write_reg(ctrl_if_, 0x09, 1, &gain, 1);
         }else{
-            ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(input_dev_, input_gain_));
+            ESP_ERROR_CHECK_SOFT(esp_codec_dev_set_in_gain(input_dev_, input_gain_));
+        }
+        // ZCODE PATCH: 回读 codec 寄存器，便于判断麦克风增益实际值
+        DumpEs8388Registers(ctrl_if_);
+        {
+            // 手册中 MIC PGA 有效范围 0~8（0~+24dB）；驱动默认写 0xbb 超出范围
+            uint8_t mic_gain = 0x88;
+            ctrl_if_->write_reg(ctrl_if_, 0x09, 1, &mic_gain, 1);
+            ESP_LOGI(TAG, "ES8388 MIC PGA -> 0x88 (+24dB L/R)");
         }
     } else {
-        ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
+        ESP_ERROR_CHECK_SOFT(esp_codec_dev_close(input_dev_));
     }
     AudioCodec::EnableInput(enable);
 }
@@ -184,10 +240,10 @@ void Es8388AudioCodec::EnableOutput(bool enable) {
                 .sample_rate = (uint32_t)output_sample_rate_,
                 .mclk_multiple = 0,
             };
-            ESP_ERROR_CHECK(esp_codec_dev_open(output_dev_, &fs));
+            ESP_ERROR_CHECK_SOFT(RetryCodecOpen(output_dev_, &fs, "output"));
             output_device_opened_ = true;
         }
-        ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, output_volume_));
+        ESP_ERROR_CHECK_SOFT(esp_codec_dev_set_out_vol(output_dev_, output_volume_));
 
         // Set analog output volume to 0dB, default is -45dB
         uint8_t reg_val = 30; // 0dB
@@ -196,7 +252,7 @@ void Es8388AudioCodec::EnableOutput(bool enable) {
             ctrl_if_->write_reg(ctrl_if_, reg, 1, &reg_val, 1);
         }
 
-        ESP_ERROR_CHECK(esp_codec_dev_set_out_mute(output_dev_, false));
+        ESP_ERROR_CHECK_SOFT(esp_codec_dev_set_out_mute(output_dev_, false));
         if (pa_pin_ != GPIO_NUM_NC) {
             gpio_set_level(pa_pin_, 1);
         }
@@ -205,7 +261,7 @@ void Es8388AudioCodec::EnableOutput(bool enable) {
         // source. Reopening the shared duplex interface after WiFi provisioning
         // can otherwise leave playback silent on ESP-IDF 6.
         if (output_device_opened_) {
-            ESP_ERROR_CHECK(esp_codec_dev_set_out_mute(output_dev_, true));
+            ESP_ERROR_CHECK_SOFT(esp_codec_dev_set_out_mute(output_dev_, true));
         }
         if (pa_pin_ != GPIO_NUM_NC) {
             gpio_set_level(pa_pin_, 0);
